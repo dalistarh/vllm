@@ -609,6 +609,7 @@ class EngineArgs:
     kv_cache_dtype_skip_layers: list[str] = get_field(
         CacheConfig, "kv_cache_dtype_skip_layers"
     )
+    wush_transforms_path: str | None = CacheConfig.wush_transforms_path
     mamba_cache_dtype: MambaDType = CacheConfig.mamba_cache_dtype
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
@@ -1057,6 +1058,9 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-cache-dtype-skip-layers", **cache_kwargs["kv_cache_dtype_skip_layers"]
+        )
+        cache_group.add_argument(
+            "--wush-transforms-path", **cache_kwargs["wush_transforms_path"]
         )
         cache_group.add_argument(
             "--kv-sharing-fast-prefill", **cache_kwargs["kv_sharing_fast_prefill"]
@@ -1633,6 +1637,7 @@ class EngineArgs:
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
+            wush_transforms_path=self.wush_transforms_path,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
@@ -1645,10 +1650,13 @@ class EngineArgs:
         # TurboQuant: auto-skip first/last 2 layers (boundary protection).
         # These layers are most sensitive to quantization error.
         # Users can add extra layers via --kv-cache-dtype-skip-layers.
-        if resolved_cache_dtype.startswith("turboquant_"):
+        from vllm.model_executor.layers.quantization.turboquant.config import (
+            is_tq_cache_dtype,
+        )
+        if is_tq_cache_dtype(resolved_cache_dtype):
             if model_config.is_hybrid:
                 raise NotImplementedError(
-                    "TurboQuant KV cache is not supported for hybrid "
+                    "TurboQuant/WUSH KV cache is not supported for hybrid "
                     "(attention + Mamba) models. Boundary layer protection "
                     "requires uniform attention layers."
                 )
@@ -1975,13 +1983,13 @@ class EngineArgs:
 
         # TurboQuant requires FlashAttention 2 — FA3 boundary layers assert
         # FlashAttentionImpl which fails with TurboQuantAttentionImpl.
-        if resolved_cache_dtype.startswith("turboquant_") and (
+        if is_tq_cache_dtype(resolved_cache_dtype) and (
             attention_config.flash_attn_version is None
             or attention_config.flash_attn_version >= 3
         ):
             logger.warning(
-                "TurboQuant is not yet compatible with FlashAttention >= 3. "
-                "Overriding flash_attn_version to 2. To silence this "
+                "TurboQuant/WUSH is not yet compatible with FlashAttention "
+                ">= 3. Overriding flash_attn_version to 2. To silence this "
                 "warning, pass --attention-config.flash_attn_version=2"
             )
             attention_config.flash_attn_version = 2

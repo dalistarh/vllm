@@ -61,9 +61,12 @@ class XPUPlatform(Platform):
             "only NHD layout is supported by XPU attention kernels."
         )
 
-        # TurboQuant KV cache: route directly to TQ backend
+        # TurboQuant / WUSH KV cache: route directly to TQ backend
         kv_cache_dtype = attn_selector_config.kv_cache_dtype
-        if kv_cache_dtype is not None and kv_cache_dtype.startswith("turboquant_"):
+        if kv_cache_dtype is not None and (
+            kv_cache_dtype.startswith("turboquant_")
+            or kv_cache_dtype.startswith("wush_")
+        ):
             logger.info_once("Using TurboQuant attention backend.")
             return AttentionBackendEnum.TURBOQUANT.get_path()
 

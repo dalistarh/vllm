@@ -94,6 +94,8 @@ class TurboQuantAttentionBackend(AttentionBackend):
         "turboquant_4bit_nc",
         "turboquant_k3v4_nc",
         "turboquant_3bit_nc",
+        "wush_4bit",
+        "wush_3bit",
     ]
 
     @staticmethod
@@ -156,7 +158,10 @@ class TurboQuantAttentionBackend(AttentionBackend):
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return False
-        return kv_cache_dtype.startswith("turboquant_")
+        from vllm.model_executor.layers.quantization.turboquant.config import (
+            is_tq_cache_dtype,
+        )
+        return is_tq_cache_dtype(kv_cache_dtype)
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
@@ -281,19 +286,22 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
     def _ensure_on_device(self, layer, device):
         """One-time derivation of TQ buffers (rotation matrix, midpoints).
 
-        The Hadamard rotation is shared across all layers: random sign
-        flips do not improve Lloyd-Max quantization quality because the
-        quantizer is symmetric around zero (sign-flipping a coordinate
-        maps it to the mirror centroid with identical distortion).
+        For standard TQ: shared Hadamard rotation across all layers.
+        For WUSH: identity rotation (transforms applied in Python).
         """
         if not hasattr(layer, "_tq_cached"):
             D = self.head_size
 
-            # Pure Hadamard: orthonormal + symmetric (H = H^T), enabling
-            # in-kernel butterfly fusion and trivial inverse for continuation.
-            H = _build_hadamard(D, str(device))
-            layer._tq_PiT = H
-            layer._tq_Pi = H
+            if self.tq_config.wush:
+                # WUSH: transforms applied in Python before/after the
+                # Triton kernels, so PiT/Pi are identity.
+                eye = torch.eye(D, device=device, dtype=torch.float32)
+                layer._tq_PiT = eye
+                layer._tq_Pi = eye
+            else:
+                H = _build_hadamard(D, str(device))
+                layer._tq_PiT = H
+                layer._tq_Pi = H
 
             c = layer._tq_centroids.to(device=device, dtype=torch.float32)
             c_sorted, _ = c.sort()
@@ -323,7 +331,20 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         k = key[:N].view(N, self.num_kv_heads, self.head_size)
         v = value[:N].view(N, self.num_kv_heads, self.head_size)
-        self._store_kv(k, v, kv_cache, slot_mapping, layer)
+
+        # WUSH needs attn_metadata for position derivation (RoPE undo).
+        attn_metadata = None
+        if self.tq_config.wush:
+            from vllm.forward_context import get_forward_context
+            fwd_ctx = get_forward_context()
+            # attn_metadata is keyed by layer name
+            attn_meta_dict = fwd_ctx.attn_metadata
+            if isinstance(attn_meta_dict, dict):
+                for meta in attn_meta_dict.values():
+                    attn_metadata = meta
+                    break
+
+        self._store_kv(k, v, kv_cache, slot_mapping, layer, attn_metadata)
 
     def forward(
         self,
@@ -373,10 +394,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         num_decode_tokens = attn_metadata.num_decode_tokens
 
         if not attn_metadata.is_prefill:
-            # Pure decode batch — fast path
-            attn_out = self._decode_attention(
-                q, kv_cache, attn_metadata, Pi, centroids, PiT, layer
-            )
+            if self.tq_config.wush:
+                # WUSH decode: dequant + inverse transform + RoPE + flash
+                attn_out = self._wush_decode_attention(
+                    q, kv_cache, attn_metadata, centroids, tq_layer,
+                )
+            else:
+                # Standard TQ decode: fused Triton kernel
+                attn_out = self._decode_attention(
+                    q, kv_cache, attn_metadata, Pi, centroids, PiT, layer
+                )
         elif num_decodes == 0:
             # Pure prefill batch
             k = key[:N].view(N, self.num_kv_heads, self.head_size)
@@ -410,9 +437,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seq_len=attn_metadata.max_seq_len,
                 is_prefill=False,
             )
-            attn_out[:num_decode_tokens] = self._decode_attention(
-                q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids, PiT, layer
-            )
+            if self.tq_config.wush:
+                attn_out[:num_decode_tokens] = self._wush_decode_attention(
+                    q[:num_decode_tokens], kv_cache, decode_meta,
+                    centroids, tq_layer,
+                )
+            else:
+                attn_out[:num_decode_tokens] = self._decode_attention(
+                    q[:num_decode_tokens], kv_cache, decode_meta,
+                    Pi, centroids, PiT, layer,
+                )
 
             # --- Prefill portion (remaining requests) ---
             # CRITICAL: use prefill-specific max_seq_len so flash_attn's
@@ -467,8 +501,18 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
         slot_mapping: torch.Tensor,
         layer: Any,
+        attn_metadata: Any = None,
     ):
-        """Quantize + store via fused Triton kernel."""
+        """Quantize + store via fused Triton kernel.
+
+        For WUSH: applies data-dependent transforms in Python before
+        calling the Triton store with identity rotation.
+        """
+        if self.tq_config.wush:
+            key, value = self._wush_transform_for_store(
+                key, value, layer, attn_metadata,
+            )
+
         triton_turboquant_store(
             key,
             value,
@@ -481,6 +525,84 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             value_quant_bits=self.tq_config.effective_value_quant_bits,
             key_fp8=self.tq_config.key_fp8,
         )
+
+    def _wush_transform_for_store(
+        self,
+        key: torch.Tensor,    # (N, Hk, D)
+        value: torch.Tensor,   # (N, Hk, D)
+        layer: Any,
+        attn_metadata: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply WUSH transforms before TQ store.
+
+        K-side: undo RoPE -> apply T_K^{-1} (per KV-head)
+        V-side: apply T_V^T (per KV-head)
+        """
+        from vllm.model_executor.layers.quantization.turboquant.wush import (
+            apply_wush_forward_k,
+            apply_wush_forward_v,
+            undo_rope,
+        )
+
+        # Derive per-token positions for RoPE undo.
+        # During store, each token's position can be inferred from
+        # metadata.  For simplicity, we use the slot_mapping to
+        # recover positions: not possible directly. Instead we pass
+        # positions via attn_metadata.seq_lens.
+        # For decode: token at position seq_len - 1.
+        # For prefill: tokens at sequential positions.
+        positions = self._derive_store_positions(attn_metadata, key.device)
+
+        # Undo RoPE from keys
+        cos = layer._wush_rope_cos.to(key.device)
+        sin = layer._wush_rope_sin.to(key.device)
+        pos_cos = cos[positions].unsqueeze(1)  # (N, 1, D)
+        pos_sin = sin[positions].unsqueeze(1)  # (N, 1, D)
+        k_pre = undo_rope(key, pos_cos, pos_sin)
+
+        # Apply WUSH K-forward: k_wush = k_pre @ T_K^{-1}
+        k_wush = apply_wush_forward_k(k_pre, layer._wush_T_K_inv)
+
+        # Apply WUSH V-forward: v_wush = v @ T_V^T
+        v_wush = apply_wush_forward_v(value, layer._wush_T_V_T)
+
+        return k_wush, v_wush
+
+    def _derive_store_positions(
+        self,
+        attn_metadata: Any,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Derive per-token absolute positions for RoPE undo during store.
+
+        For decode: each token is at position seq_len - 1.
+        For prefill: tokens are at sequential positions within each request.
+        """
+        if attn_metadata is None:
+            return torch.zeros(1, dtype=torch.long, device=device)
+
+        if not attn_metadata.is_prefill:
+            return (attn_metadata.seq_lens - 1).long()
+
+        # Prefill: build position tensor from query_start_loc and seq_lens
+        qsl = attn_metadata.query_start_loc
+        seq_lens = attn_metadata.seq_lens
+        num_reqs = qsl.shape[0] - 1
+        N = attn_metadata.num_actual_tokens
+
+        positions = torch.empty(N, dtype=torch.long, device=device)
+        qsl_list = qsl.tolist()
+        seq_lens_list = seq_lens.tolist()
+        for i in range(num_reqs):
+            q_start = qsl_list[i]
+            q_end = qsl_list[i + 1]
+            q_len = q_end - q_start
+            seq_len = seq_lens_list[i]
+            start_pos = seq_len - q_len
+            positions[q_start:q_end] = torch.arange(
+                start_pos, seq_len, device=device, dtype=torch.long,
+            )
+        return positions
 
     # ------------------------------------------------------------------ #
     #  Prefill: SDPA on raw Q/K/V with causal mask                        #
@@ -581,8 +703,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 # by do_kv_cache_update. Use decode kernel directly to
                 # avoid O(cached_len) full-dequant per continuation.
                 # For large continuations, fall back to _continuation_prefill.
+                # WUSH: always use dequant path (fused kernel incompatible).
                 cached_len = seq_len - q_len
-                if q_len <= _CONTINUATION_DECODE_THRESHOLD:
+                if not self.tq_config.wush and q_len <= _CONTINUATION_DECODE_THRESHOLD:
                     # Fast path: treat each query as a decode request
                     # with incremental seq_lens for causal masking.
                     synth_seq_lens = torch.arange(
@@ -702,20 +825,29 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         )
 
         # Inverse-rotate MSE keys back to original space
-        if not self.tq_config.key_fp8:
+        if self.tq_config.wush:
+            k_cached_trim, v_cached_trim = self._wush_inverse_dequant(
+                k_cached[0, :, :cached_len, :],  # (Hk, cached_len, D)
+                v_cached[0, :, :cached_len, :],  # (Hk, cached_len, D)
+                layer,
+                cached_len,
+            )
+        elif not self.tq_config.key_fp8:
             k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D).float()
             k_flat = k_flat @ Pi
             k_cached_trim = (
                 k_flat.to(torch.float16).reshape(Hk, cached_len, D).transpose(0, 1)
             )  # (cached_len, Hk, D)
+            v_cached_trim = (
+                v_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
+            )  # (cached_len, Hk, D)
         else:
             k_cached_trim = (
                 k_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
             )  # (cached_len, Hk, D)
-
-        v_cached_trim = (
-            v_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
-        )  # (cached_len, Hk, D)
+            v_cached_trim = (
+                v_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
+            )  # (cached_len, Hk, D)
 
         # Concatenate cached + current chunk K/V (match query dtype)
         qdtype = query.dtype
@@ -798,3 +930,151 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             max_num_kv_splits=self.max_num_kv_splits,
         )
         return result
+
+    # ------------------------------------------------------------------ #
+    #  WUSH-specific methods                                              #
+    # ------------------------------------------------------------------ #
+    def _wush_inverse_dequant(
+        self,
+        k_wush: torch.Tensor,   # (Hk, cached_len, D) — dequanted, still in WUSH space
+        v_wush: torch.Tensor,   # (Hk, cached_len, D)
+        layer: Any,
+        cached_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply inverse WUSH transforms and RoPE to dequanted cache data.
+
+        Returns (k_post_rope, v) both as (cached_len, Hk, D).
+        """
+        from vllm.model_executor.layers.quantization.turboquant.wush import (
+            apply_rope,
+            apply_wush_inverse_k,
+            apply_wush_inverse_v,
+        )
+
+        D = self.head_size
+        device = k_wush.device
+
+        # Transpose to (cached_len, Hk, D) for per-head transforms
+        k_t = k_wush.transpose(0, 1).contiguous()  # (cached_len, Hk, D)
+        v_t = v_wush.transpose(0, 1).contiguous()
+
+        # K-side: inverse WUSH -> pre-RoPE keys
+        k_pre = apply_wush_inverse_k(k_t, layer._wush_T_K)
+
+        # Re-apply RoPE at each position
+        positions = torch.arange(cached_len, device=device, dtype=torch.long)
+        cos = layer._wush_rope_cos.to(device)[positions]  # (cached_len, D)
+        sin = layer._wush_rope_sin.to(device)[positions]
+        k_post = apply_rope(
+            k_pre,
+            cos.unsqueeze(1),   # (cached_len, 1, D)
+            sin.unsqueeze(1),
+        )
+
+        # V-side: inverse WUSH
+        v_out = apply_wush_inverse_v(v_t, layer._wush_T_V_inv_T)
+
+        return k_post.to(torch.float16), v_out.to(torch.float16)
+
+    def _wush_decode_attention(
+        self,
+        query: torch.Tensor,        # (B, Hq, D)
+        kv_cache: torch.Tensor,      # (num_blocks, block_size, Hk, slot_size)
+        attn_metadata: TurboQuantMetadata,
+        centroids: torch.Tensor,
+        layer: Any,
+    ) -> torch.Tensor:
+        """WUSH decode: dequant cached K/V, inverse transform, RoPE, flash.
+
+        Routes each request through the continuation-prefill dequant path
+        since the fused TQ decode kernel is incompatible with non-orthogonal
+        WUSH transforms.
+        """
+        B, Hq, D = query.shape
+        Hk = self.num_kv_heads
+        device = query.device
+        block_size = kv_cache.shape[1]
+        BLOCK_D = triton.next_power_of_2(D)
+
+        mse_bytes = self._mse_bytes
+        val_data_bytes = self._val_data_bytes
+
+        output = torch.zeros(B, Hq, D, device=device, dtype=query.dtype)
+        seq_lens_list = attn_metadata.seq_lens.tolist()
+
+        for i in range(B):
+            seq_len = seq_lens_list[i]
+            if seq_len <= 0:
+                continue
+
+            # Dequant cached K/V for this request
+            alloc_len = math.ceil(seq_len / block_size) * block_size
+            k_buf = torch.empty(
+                1, Hk, alloc_len, D, dtype=torch.float16, device=device,
+            )
+            v_buf = torch.empty(
+                1, Hk, alloc_len, D, dtype=torch.float16, device=device,
+            )
+            k_buf.zero_()
+            v_buf.zero_()
+
+            bt = attn_metadata.block_table[i:i + 1]
+            grid = (alloc_len, Hk)
+            _tq_full_dequant_kv[grid](
+                kv_cache, bt, centroids, k_buf, v_buf,
+                k_buf.stride(0), k_buf.stride(1), k_buf.stride(2),
+                v_buf.stride(0), v_buf.stride(1), v_buf.stride(2),
+                kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+                bt.stride(0),
+                HEAD_DIM=D,
+                BLOCK_SIZE=block_size,
+                NUM_KV_HEADS=Hk,
+                MSE_BYTES=mse_bytes,
+                KPS=self.tq_config.key_packed_size,
+                VQB=self.tq_config.effective_value_quant_bits,
+                VAL_DATA_BYTES=val_data_bytes,
+                MSE_BITS=self.tq_config.key_mse_bits,
+                KEY_FP8=0,
+                BLOCK_D=BLOCK_D,
+                NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
+                FP8_E4B15=0,
+                num_warps=4,
+            )
+
+            # Inverse WUSH + RoPE
+            k_post, v_out = self._wush_inverse_dequant(
+                k_buf[0, :, :seq_len, :],
+                v_buf[0, :, :seq_len, :],
+                layer, seq_len,
+            )
+
+            # Single-query attention via flash or SDPA
+            q_i = query[i:i + 1]  # (1, Hq, D)
+            if _HAS_FLASH_ATTN:
+                cu_q = torch.tensor([0, 1], device=device, dtype=torch.int32)
+                cu_k = torch.tensor(
+                    [0, seq_len], device=device, dtype=torch.int32,
+                )
+                out = flash_attn_varlen_func(
+                    q=q_i,
+                    k=k_post,
+                    v=v_out,
+                    cu_seqlens_q=cu_q,
+                    cu_seqlens_k=cu_k,
+                    max_seqlen_q=1,
+                    max_seqlen_k=seq_len,
+                    softmax_scale=self.scale,
+                    causal=True,
+                )
+            else:
+                q_t = q_i.transpose(0, 1).unsqueeze(0)
+                k_t = k_post.transpose(0, 1).unsqueeze(0)
+                v_t = v_out.transpose(0, 1).unsqueeze(0)
+                out = F.scaled_dot_product_attention(
+                    q_t, k_t, v_t,
+                    scale=self.scale,
+                    enable_gqa=(Hk < Hq),
+                )[0].transpose(0, 1)
+            output[i] = out[0].to(query.dtype)
+
+        return output

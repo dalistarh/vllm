@@ -28,6 +28,8 @@ CacheDType = Literal[
     "turboquant_4bit_nc",
     "turboquant_k3v4_nc",
     "turboquant_3bit_nc",
+    "wush_4bit",
+    "wush_3bit",
     "int8_per_token_head",
     "fp8_per_token_head",
     "nvfp4",
@@ -102,6 +104,10 @@ class CacheConfig:
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
+    wush_transforms_path: str | None = None
+    """Path to pre-calibrated WUSH-KV transform file (safetensors or .pt).
+    Required when using wush_* kv-cache-dtype presets. If omitted, vLLM
+    attempts auto-discovery from the model directory."""
     mamba_page_size_padded: int | None = None
     """ Optional override for mamba page size; used by hybrid mamba/attention
     models to ensure exact alignment with attention page size."""

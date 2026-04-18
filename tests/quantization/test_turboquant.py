@@ -542,3 +542,101 @@ class TestStoreDecodeRoundTrip:
             assert cos_sim > threshold, (
                 f"Preset {preset} head {h}: cosine_sim={cos_sim:.4f} < {threshold}"
             )
+
+
+# ============================================================================
+# WUSH-KV config and transform tests (no GPU required)
+# ============================================================================
+
+
+class TestWUSHConfig:
+    """Tests for WUSH preset configuration."""
+
+    WUSH_PRESETS = [p for p in ALL_PRESETS if p.startswith("wush_")]
+
+    def test_wush_presets_exist(self):
+        assert len(self.WUSH_PRESETS) >= 2, "Expected at least wush_3bit and wush_4bit"
+
+    @pytest.mark.parametrize("preset", WUSH_PRESETS)
+    def test_wush_preset_parses(self, preset):
+        cfg = TurboQuantConfig.from_cache_dtype(preset, 128)
+        assert cfg.wush is True
+        assert cfg.key_quant_bits in (3, 4)
+
+    @pytest.mark.parametrize("preset", WUSH_PRESETS)
+    def test_wush_norm_correction_enabled(self, preset):
+        cfg = TurboQuantConfig.from_cache_dtype(preset, 128)
+        assert cfg.norm_correction is True
+
+    @pytest.mark.parametrize("preset", WUSH_PRESETS)
+    def test_wush_not_fp8(self, preset):
+        cfg = TurboQuantConfig.from_cache_dtype(preset, 128)
+        assert cfg.key_fp8 is False
+
+    def test_is_tq_cache_dtype(self):
+        from vllm.model_executor.layers.quantization.turboquant.config import (
+            is_tq_cache_dtype,
+        )
+        assert is_tq_cache_dtype("wush_3bit")
+        assert is_tq_cache_dtype("wush_4bit")
+        assert is_tq_cache_dtype("turboquant_4bit_nc")
+        assert not is_tq_cache_dtype("fp8")
+        assert not is_tq_cache_dtype("auto")
+
+
+class TestWUSHTransforms:
+    """Tests for WUSH transform utilities (CPU-only)."""
+
+    def test_rope_roundtrip(self):
+        from vllm.model_executor.layers.quantization.turboquant.wush import (
+            apply_rope,
+            build_rope_cache,
+            undo_rope,
+        )
+        D = 128
+        cos, sin = build_rope_cache(D, 256, rope_theta=10000.0)
+        x = torch.randn(8, 4, D)
+        positions = torch.arange(8)
+        c = cos[positions].unsqueeze(1)
+        s = sin[positions].unsqueeze(1)
+        x_rope = apply_rope(x, c, s)
+        x_back = undo_rope(x_rope, c, s)
+        assert torch.allclose(x, x_back, atol=1e-5), "RoPE undo/redo roundtrip failed"
+
+    def test_forward_inverse_k_roundtrip(self):
+        from vllm.model_executor.layers.quantization.turboquant.wush import (
+            apply_wush_forward_k,
+            apply_wush_inverse_k,
+        )
+        Hk, D = 4, 128
+        T_K = torch.randn(Hk, D, D).double()
+        # Make T_K well-conditioned
+        T_K = T_K @ T_K.transpose(-2, -1) + torch.eye(D).unsqueeze(0) * 5
+        T_K = T_K.float()
+        T_K_inv = torch.linalg.inv(T_K)
+
+        x = torch.randn(8, Hk, D)
+        x_fwd = apply_wush_forward_k(x, T_K_inv)
+        x_back = apply_wush_inverse_k(x_fwd, T_K)
+        assert torch.allclose(x, x_back, atol=1e-3), (
+            f"K roundtrip failed: max err {(x - x_back).abs().max():.6f}"
+        )
+
+    def test_forward_inverse_v_roundtrip(self):
+        from vllm.model_executor.layers.quantization.turboquant.wush import (
+            apply_wush_forward_v,
+            apply_wush_inverse_v,
+        )
+        Hk, D = 4, 128
+        T_V = torch.randn(Hk, D, D).double()
+        T_V = T_V @ T_V.transpose(-2, -1) + torch.eye(D).unsqueeze(0) * 5
+        T_V = T_V.float()
+        T_V_T = T_V.transpose(-2, -1)
+        T_V_inv_T = torch.linalg.inv(T_V).transpose(-2, -1)
+
+        x = torch.randn(8, Hk, D)
+        x_fwd = apply_wush_forward_v(x, T_V_T)
+        x_back = apply_wush_inverse_v(x_fwd, T_V_inv_T)
+        assert torch.allclose(x, x_back, atol=1e-3), (
+            f"V roundtrip failed: max err {(x - x_back).abs().max():.6f}"
+        )

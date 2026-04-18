@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -379,8 +380,11 @@ class Attention(nn.Module, AttentionLayerBase):
         # Initialize KV cache quantization attributes
         _init_kv_cache_quant(self, quant_config, prefix)
 
-        # Initialize TurboQuant buffers (Pi, S, centroids) if tq cache dtype
-        if kv_cache_dtype.startswith("turboquant_"):
+        # Initialize TurboQuant / WUSH buffers if tq cache dtype
+        from vllm.model_executor.layers.quantization.turboquant.config import (
+            is_tq_cache_dtype,
+        )
+        if is_tq_cache_dtype(kv_cache_dtype):
             self._init_turboquant_buffers(kv_cache_dtype, head_size, prefix)
 
         # for attn backends supporting query quantization
@@ -406,7 +410,7 @@ class Attention(nn.Module, AttentionLayerBase):
     def _init_turboquant_buffers(
         self, cache_dtype: str, head_size: int, prefix: str
     ) -> None:
-        """Initialize TurboQuant centroids for Lloyd-Max quantization."""
+        """Initialize TurboQuant/WUSH centroids, rotation, and decode buffers."""
         from vllm.model_executor.layers.quantization.turboquant.centroids import (
             get_centroids,
         )
@@ -446,6 +450,88 @@ class Attention(nn.Module, AttentionLayerBase):
             torch.empty(B, Hq, dtype=torch.float32),
             persistent=False,
         )
+
+        # --- WUSH-specific buffers ---
+        if tq_config.wush:
+            self._init_wush_buffers(
+                head_size, prefix, _vllm_cfg,
+            )
+
+    def _init_wush_buffers(
+        self, head_size: int, prefix: str, vllm_cfg,
+    ) -> None:
+        """Load WUSH transforms and RoPE cache for this layer."""
+        from vllm.model_executor.layers.quantization.turboquant.wush import (
+            build_rope_cache,
+            discover_wush_transforms_path,
+            load_wush_transforms,
+        )
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        layer_idx = extract_layer_index(prefix)
+
+        # Resolve transforms path
+        cache_cfg = vllm_cfg.cache_config
+        model_cfg = vllm_cfg.model_config
+        transforms_path = cache_cfg.wush_transforms_path
+        if transforms_path is None:
+            transforms_path = discover_wush_transforms_path(
+                model_cfg.model
+            )
+        if transforms_path is None:
+            raise FileNotFoundError(
+                f"WUSH transforms required but not found. Provide "
+                f"--wush-transforms-path or place "
+                f"wush_transforms.safetensors in {model_cfg.model}"
+            )
+
+        # Load transforms (cached across layers via functools.cache
+        # on the path string — each layer just picks its own slice).
+        transforms = _load_wush_transforms_cached(
+            transforms_path,
+            model_cfg.hf_text_config.num_hidden_layers,
+        )
+
+        # Register per-layer transform buffers
+        self.register_buffer(
+            "_wush_T_K",
+            transforms["k"][layer_idx],
+        )
+        self.register_buffer(
+            "_wush_T_K_inv",
+            transforms["k_inv"][layer_idx],
+        )
+        self.register_buffer(
+            "_wush_T_V_T",
+            transforms["v_t"][layer_idx],
+        )
+        self.register_buffer(
+            "_wush_T_V_inv_T",
+            transforms["v_inv_t"][layer_idx],
+        )
+
+        # RoPE cache for undo/redo during store and decode
+        rope_theta = getattr(
+            model_cfg.hf_text_config, "rope_theta", 10000.0
+        )
+        max_pos = getattr(
+            model_cfg.hf_text_config, "max_position_embeddings", 8192
+        )
+        cos, sin = build_rope_cache(head_size, max_pos, rope_theta)
+        self.register_buffer("_wush_rope_cos", cos, persistent=False)
+        self.register_buffer("_wush_rope_sin", sin, persistent=False)
+
+
+@functools.cache
+def _load_wush_transforms_cached(path: str, num_layers: int):
+    """Load WUSH transforms once and cache across layers."""
+    from vllm.model_executor.layers.quantization.turboquant.wush import (
+        load_wush_transforms,
+    )
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("Loading WUSH transforms from %s", path)
+    return load_wush_transforms(path, num_layers, torch.device("cpu"))
 
     def forward(
         self,
@@ -594,7 +680,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_quant_mode=quant_mode,
                 sliding_window=self.sliding_window,
             )
-        elif self.kv_cache_dtype.startswith("turboquant_"):
+        elif is_tq_cache_dtype(self.kv_cache_dtype):
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
             )

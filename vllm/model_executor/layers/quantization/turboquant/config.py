@@ -29,7 +29,27 @@ TQ_PRESETS: dict[str, dict] = {
         "value_quant_bits": 3,
         "norm_correction": True,
     },
+    # WUSH-KV presets: data-dependent rotation instead of fixed Hadamard.
+    # Requires pre-calibrated transforms (--wush-transforms-path or
+    # wush_transforms.safetensors bundled with model).
+    "wush_4bit": {
+        "key_quant_bits": 4,
+        "value_quant_bits": 4,
+        "norm_correction": True,
+        "wush": True,
+    },
+    "wush_3bit": {
+        "key_quant_bits": 3,
+        "value_quant_bits": 3,
+        "norm_correction": True,
+        "wush": True,
+    },
 }
+
+
+def is_tq_cache_dtype(cache_dtype: str) -> bool:
+    """Check if a cache dtype string is a TurboQuant/WUSH preset."""
+    return cache_dtype in TQ_PRESETS
 
 
 @dataclass
@@ -58,6 +78,8 @@ class TurboQuantConfig:
         turboquant_4bit_nc: 4-bit MSE keys + 4-bit values + NC, 3.8x, +2.71%
         turboquant_k3v4_nc: 3-bit MSE keys + 4-bit values + NC, ~3.5x, +10.63%
         turboquant_3bit_nc: 3-bit MSE keys + 3-bit values + NC, 4.9x, +20.59%
+        wush_4bit: WUSH 4-bit keys + 4-bit values + NC (data-dependent rotation)
+        wush_3bit: WUSH 3-bit keys + 3-bit values + NC (data-dependent rotation)
 
     Args:
         head_dim: Attention head dimension (e.g. 64, 96, 128).
@@ -68,6 +90,8 @@ class TurboQuantConfig:
         norm_correction: Re-normalize centroid vectors to unit norm before
             inverse rotation during dequant. Fixes quantization-induced norm
             distortion, improving PPL by ~0.8% at 4-bit.
+        wush: If True, use pre-calibrated WUSH data-dependent rotation
+            instead of fixed Hadamard. Requires transform files.
     """
 
     head_dim: int = 128
@@ -75,6 +99,7 @@ class TurboQuantConfig:
     value_quant_bits: int = 4  # 3-4 = uniform quantized values
     seed: int = 42  # kept for backward compatibility; no longer used internally
     norm_correction: bool = False
+    wush: bool = False
 
     @property
     def key_fp8(self) -> bool:
@@ -192,4 +217,5 @@ class TurboQuantConfig:
             key_quant_bits=preset["key_quant_bits"],
             value_quant_bits=preset["value_quant_bits"],
             norm_correction=preset["norm_correction"],
+            wush=preset.get("wush", False),
         )
