@@ -48,6 +48,7 @@ from vllm.v1.attention.ops.triton_turboquant_decode import (
     triton_turboquant_decode_attention,
 )
 from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_store
+from vllm.v1.attention.ops.triton_wush_decode import triton_wush_decode_attention
 
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
@@ -984,97 +985,49 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         centroids: torch.Tensor,
         layer: Any,
     ) -> torch.Tensor:
-        """WUSH decode: dequant cached K/V, inverse transform, RoPE, flash.
+        """WUSH decode via fused Triton kernel.
 
-        Routes each request through the continuation-prefill dequant path
-        since the fused TQ decode kernel is incompatible with non-orthogonal
-        WUSH transforms.
+        K-side: dequant + T_K^T matmul + RoPE + scoring — all in-kernel.
+        V-side: accumulate in WUSH space; T_V^{-1} applied once after
+        stage-2 reduction.
         """
-        B, Hq, D = query.shape
-        Hk = self.num_kv_heads
-        device = query.device
-        block_size = kv_cache.shape[1]
-        BLOCK_D = triton.next_power_of_2(D)
+        # Prepare RoPE caches: Triton kernel expects [max_pos, D/2]
+        cos = layer._wush_rope_cos.to(query.device)
+        sin = layer._wush_rope_sin.to(query.device)
+        D = self.head_size
+        half_d = D // 2
+        # The RoPE cache is [max_pos, D] with duplicated halves;
+        # the Triton kernel expects [max_pos, D/2].
+        cos_half = cos[:, :half_d].contiguous()
+        sin_half = sin[:, :half_d].contiguous()
 
-        mse_bytes = self._mse_bytes
-        val_data_bytes = self._val_data_bytes
+        # T_K transposed = T_K^T (for inverse WUSH on K)
+        T_K_T = layer._wush_T_K.transpose(-2, -1).contiguous()
+        # T_V^{-1} (for inverse WUSH on V, applied once after reduction)
+        T_V_inv = layer._wush_T_V_inv_T.transpose(-2, -1).contiguous()
 
-        output = torch.zeros(B, Hq, D, device=device, dtype=query.dtype)
-        seq_lens_list = attn_metadata.seq_lens.tolist()
+        mid_o_buf = getattr(layer, "_tq_mid_o_buf", None)
+        output_buf = getattr(layer, "_tq_output_buf", None)
+        lse_buf = getattr(layer, "_tq_lse_buf", None)
 
-        for i in range(B):
-            seq_len = seq_lens_list[i]
-            if seq_len <= 0:
-                continue
-
-            # Dequant cached K/V for this request
-            alloc_len = math.ceil(seq_len / block_size) * block_size
-            k_buf = torch.empty(
-                1, Hk, alloc_len, D, dtype=torch.float16, device=device,
-            )
-            v_buf = torch.empty(
-                1, Hk, alloc_len, D, dtype=torch.float16, device=device,
-            )
-            k_buf.zero_()
-            v_buf.zero_()
-
-            bt = attn_metadata.block_table[i:i + 1]
-            grid = (alloc_len, Hk)
-            _tq_full_dequant_kv[grid](
-                kv_cache, bt, centroids, k_buf, v_buf,
-                k_buf.stride(0), k_buf.stride(1), k_buf.stride(2),
-                v_buf.stride(0), v_buf.stride(1), v_buf.stride(2),
-                kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
-                bt.stride(0),
-                HEAD_DIM=D,
-                BLOCK_SIZE=block_size,
-                NUM_KV_HEADS=Hk,
-                MSE_BYTES=mse_bytes,
-                KPS=self.tq_config.key_packed_size,
-                VQB=self.tq_config.effective_value_quant_bits,
-                VAL_DATA_BYTES=val_data_bytes,
-                MSE_BITS=self.tq_config.key_mse_bits,
-                KEY_FP8=0,
-                BLOCK_D=BLOCK_D,
-                NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
-                FP8_E4B15=0,
-                num_warps=4,
-            )
-
-            # Inverse WUSH + RoPE
-            k_post, v_out = self._wush_inverse_dequant(
-                k_buf[0, :, :seq_len, :],
-                v_buf[0, :, :seq_len, :],
-                layer, seq_len,
-            )
-
-            # Single-query attention via flash or SDPA
-            q_i = query[i:i + 1]  # (1, Hq, D)
-            if _HAS_FLASH_ATTN:
-                cu_q = torch.tensor([0, 1], device=device, dtype=torch.int32)
-                cu_k = torch.tensor(
-                    [0, seq_len], device=device, dtype=torch.int32,
-                )
-                out = flash_attn_varlen_func(
-                    q=q_i,
-                    k=k_post,
-                    v=v_out,
-                    cu_seqlens_q=cu_q,
-                    cu_seqlens_k=cu_k,
-                    max_seqlen_q=1,
-                    max_seqlen_k=seq_len,
-                    softmax_scale=self.scale,
-                    causal=True,
-                )
-            else:
-                q_t = q_i.transpose(0, 1).unsqueeze(0)
-                k_t = k_post.transpose(0, 1).unsqueeze(0)
-                v_t = v_out.transpose(0, 1).unsqueeze(0)
-                out = F.scaled_dot_product_attention(
-                    q_t, k_t, v_t,
-                    scale=self.scale,
-                    enable_gqa=(Hk < Hq),
-                )[0].transpose(0, 1)
-            output[i] = out[0].to(query.dtype)
-
-        return output
+        return triton_wush_decode_attention(
+            query=query,
+            kv_cache=kv_cache,
+            block_table=attn_metadata.block_table,
+            seq_lens=attn_metadata.seq_lens,
+            centroids=centroids,
+            T_K_T=T_K_T,
+            T_V_inv=T_V_inv,
+            cos_cache=cos_half,
+            sin_cache=sin_half,
+            scale=self.scale,
+            mse_bits=self.tq_config.key_mse_bits,
+            key_packed_size=self.tq_config.key_packed_size,
+            value_quant_bits=self.tq_config.effective_value_quant_bits,
+            norm_correction=self.tq_config.norm_correction,
+            mid_o_buf=mid_o_buf,
+            output_buf=output_buf,
+            lse_buf=lse_buf,
+            buf_holder=layer,
+            max_num_kv_splits=self.max_num_kv_splits,
+        )

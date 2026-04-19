@@ -140,6 +140,9 @@ def _wush_decode_stage1(
 
         # ---- K: T_K^T matmul (tiled over contraction dim) ----
         # k_pre[d_out] = sum_{d_in} k_wush[d_in] * T_K_T[kv_head, d_in, d_out]
+        # Store k_wush to scratch so we can load tiles by offset.
+        tl.store(Scratch_ptr + scratch_base + d_offs, k_wush, mask=d_mask)
+
         k_pre = tl.zeros([BLOCK_D], dtype=tl.float32)
         for tile in range(0, HEAD_DIM, TILE_K):
             t_offs = tile + tl.arange(0, TILE_K)
@@ -154,18 +157,11 @@ def _wush_decode_stage1(
                 mask=t_mask[:, None] & d_mask[None, :], other=0.0,
             )
 
-            # Extract k_wush elements for this tile
-            k_tile = tl.load(
-                Centroids_ptr + tl.where(t_mask, idx, 0),
-                mask=t_mask, other=0.0,
-            )
-            # Need the actual k_wush values, not re-gathered centroids
-            # Write k_wush to scratch, read back the tile
-            tl.store(Scratch_ptr + scratch_base + d_offs, k_wush, mask=d_mask)
+            # Load k_wush slice for this tile from scratch
             k_slice = tl.load(
                 Scratch_ptr + scratch_base + t_offs,
                 mask=t_mask, other=0.0,
-            )
+            )  # [TILE_K]
 
             # Accumulate: k_pre += k_slice @ tk_tile
             k_pre += tl.sum(k_slice[:, None] * tk_tile, axis=0)
@@ -174,16 +170,13 @@ def _wush_decode_stage1(
         # Write k_pre to scratch for rotate_half gather
         tl.store(Scratch_ptr + scratch_base + d_offs, k_pre, mask=d_mask)
 
-        # Load cos/sin for this position (half-dim, duplicated)
-        half_offs = tl.arange(0, BLOCK_D)
-        h_mask = half_offs < HALF_DIM
-        cos_h = tl.load(Cos_ptr + pos * stride_cos_pos + half_offs,
-                        mask=h_mask, other=1.0)
-        sin_h = tl.load(Sin_ptr + pos * stride_cos_pos + half_offs,
-                        mask=h_mask, other=0.0)
-        # Expand to full dim: cos[d] = cos_h[d % HALF_DIM]
-        cos_full = tl.where(d_offs < HALF_DIM, cos_h, cos_h)
-        sin_full = tl.where(d_offs < HALF_DIM, sin_h, sin_h)
+        # Load cos/sin for this position.
+        # cos_cache is [max_pos, D/2]. For full D, duplicate: cos[d] = cos[d % half]
+        cos_idx = d_offs % HALF_DIM
+        cos_full = tl.load(Cos_ptr + pos * stride_cos_pos + cos_idx,
+                           mask=d_mask, other=1.0)
+        sin_full = tl.load(Sin_ptr + pos * stride_cos_pos + cos_idx,
+                           mask=d_mask, other=0.0)
 
         # rotate_half via scratch gather
         k_rot = rot_sign * tl.load(
@@ -335,11 +328,11 @@ def triton_wush_decode_attention(
         lse = torch.empty(B, Hq, dtype=torch.float32, device=device)
 
     _fwd_kernel_stage2[(B, Hq)](
-        mid_o, output, lse,
+        mid_o, output, lse, seq_lens,
         mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
         output.stride(0), output.stride(1),
         lse.stride(0),
-        HEAD_DIM=D, BLOCK_D=BLOCK_D, NUM_KV_SPLITS=NUM_KV_SPLITS,
+        NUM_KV_SPLITS=NUM_KV_SPLITS, BLOCK_DV=BLOCK_D, Lv=D,
         num_warps=4,
     )
 
