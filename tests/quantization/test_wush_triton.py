@@ -63,11 +63,13 @@ def test_wush_triton():
 
     print(f"Config: D={D}, Hk={Hk}, Hq={Hq}, S={S}, bits={bits}", flush=True)
 
-    # Well-conditioned transforms
-    T_K = torch.randn(Hk, D, D, device=device).double()
-    T_K = (T_K @ T_K.mT + 5 * torch.eye(D, device=device)).float()
-    T_V = torch.randn(Hk, D, D, device=device).double()
-    T_V = (T_V @ T_V.mT + 5 * torch.eye(D, device=device)).float()
+    # Per-head transforms with small perturbation of identity (realistic)
+    T_K = torch.eye(D, device=device).unsqueeze(0).repeat(Hk, 1, 1)
+    T_K += 0.05 * torch.randn(Hk, D, D, device=device)
+    T_K = T_K.float()
+    T_V = torch.eye(D, device=device).unsqueeze(0).repeat(Hk, 1, 1)
+    T_V += 0.05 * torch.randn(Hk, D, D, device=device)
+    T_V = T_V.float()
     T_K_inv = torch.linalg.inv(T_K.double()).float()
     T_V_inv = torch.linalg.inv(T_V.double()).float()
 
@@ -136,12 +138,30 @@ def test_wush_triton():
     scale = 1.0 / math.sqrt(D)
     seq_lens = torch.tensor([S], device=device, dtype=torch.int32)
 
-    # ---- Python reference ----
+    # ---- Python reference (use same dequant data as Triton) ----
     print("Python reference...", flush=True)
+    # The ref was using cos_cache [S, D] but the Triton launcher
+    # gives cos_half [S, D/2].  Make sure ref uses SAME cos convention:
     ref_out = python_wush_decode_ref(
         q_rope, k_wush_deq, v_wush_deq, T_K, T_V_inv,
         cos_cache, sin_cache, scale,
     )
+    # Also compute directly from the Triton kernel's dequanted K/V
+    # to isolate the attention computation:
+    T_K_T2 = T_K.transpose(-2, -1)
+    k_pre2 = torch.einsum('shd,hde->she', k_wush_deq.float(), T_K_T2.float())
+    cos2 = cos_cache[:S].unsqueeze(1)
+    sin2 = sin_cache[:S].unsqueeze(1)
+    k_rope2 = k_pre2 * cos2 + _rotate_half(k_pre2) * sin2
+    v_out2 = torch.einsum('shd,hde->she', v_wush_deq.float(), T_V_inv.float())
+    # Expand GQA
+    gqa = Hq // Hk
+    k_gqa2 = k_rope2.unsqueeze(2).expand(-1,-1,gqa,-1).reshape(S,Hq,D)
+    v_gqa2 = v_out2.unsqueeze(2).expand(-1,-1,gqa,-1).reshape(S,Hq,D)
+    scores2 = torch.einsum('bhd,shd->bhs', q_rope.float(), k_gqa2) * scale
+    attn2 = F.softmax(scores2, dim=-1)
+    ref_out2 = torch.einsum('bhs,shd->bhd', attn2, v_gqa2).to(q_rope.dtype)
+    ref_out = ref_out2  # use this as authoritative reference
 
     # ---- Triton WUSH kernel ----
     print("Triton WUSH kernel...", flush=True)

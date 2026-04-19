@@ -1,241 +1,171 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Triton fused WUSH-KV decode attention.
+"""Triton fused WUSH-KV decode: two-kernel pipeline.
 
-WUSH variant of the TurboQuant decode kernel.  Keys stored in
-pre-RoPE WUSH-transformed space; kernel applies inverse WUSH
-(T_K^T matmul) and RoPE per cached token during scoring.
+Kernel 1 (_wush_dequant_transform_kv): parallel across (pos, head)
+  K-side: dequant centroids*norm → T_K^T matmul → RoPE → fp16 output
+  V-side: dequant → fp16 output (stays in WUSH space)
 
-Values accumulated in WUSH space; T_V^{-1} applied once after
-stage-2 reduction — saves O(seq_len * D^2) vs per-token dequant.
+Kernel 2: standard flash attention / SDPA on dequanted K/V
 
-Cache layout identical to TurboQuant (shared store kernel).
+Post-kernel: T_V^{-1} applied once to attention output (one matmul
+per head, not per token — saves O(S*D^2) vs per-token transform).
 """
+from __future__ import annotations
 
 import math
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.ops.triton_decode_attention import (
-    _fwd_kernel_stage2,
-)
 
+
+# ---- Kernel 1: Fused dequant + T_K^T + RoPE (parallel across tokens) ----
 
 @triton.jit
-def _wush_decode_stage1(
-    Q_ptr,              # [B, Hq, D] float32 — post-RoPE query
+def _wush_dequant_transform_kv(
     KV_cache_ptr,       # [num_blocks, block_size, Hk, padded_slot] uint8
     Block_table_ptr,    # [B, max_num_blocks] int32
-    Seq_lens_ptr,       # [B] int32
     Centroids_ptr,      # [n_centroids] float32
-    T_K_T_ptr,          # [Hk, D, D] float32 — per-head T_K transposed
+    T_K_T_ptr,          # [Hk, D, D] float32 — T_K transposed
     Cos_ptr,            # [max_pos, D/2] float32
     Sin_ptr,            # [max_pos, D/2] float32
-    Scratch_ptr,        # [B, Hq, D] float32 — scratch for rotate_half
-    Mid_o_ptr,          # [B, Hq, NUM_KV_SPLITS, D+1] float32
+    K_out_ptr,          # [B, Hk, alloc_len, D] float16 — post-RoPE keys
+    V_out_ptr,          # [B, Hk, alloc_len, D] float16 — WUSH-space values
+    Scratch_ptr,        # [num_blocks_total, Hk, D] float32 — for rotate_half
     # Strides
-    stride_qb, stride_qh,
+    stride_ko_b, stride_ko_h, stride_ko_s,
+    stride_vo_b, stride_vo_h, stride_vo_s,
     stride_cb, stride_cp, stride_ch,
     stride_bt,
-    stride_mb, stride_mh, stride_ms,
     stride_th, stride_tr, stride_tc,
-    stride_sb, stride_sh,
     stride_cos_pos,
+    stride_scratch_p, stride_scratch_h,
     # Constexpr
-    NUM_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     HALF_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    NUM_KV_SPLITS: tl.constexpr,
-    KV_GROUP_SIZE: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
     MSE_BITS: tl.constexpr,
     MSE_BYTES: tl.constexpr,
     KPS: tl.constexpr,
     VQB: tl.constexpr,
     VAL_DATA_BYTES: tl.constexpr,
-    ATTN_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
     NORM_CORRECTION: tl.constexpr = 0,
     TILE_K: tl.constexpr = 32,
 ):
-    """Process one KV-split: dequant K + T_K^T + RoPE + score; accumulate V."""
-    bid = tl.program_id(0)
-    hid = tl.program_id(1)
-    sid = tl.program_id(2)
-    kv_head = hid // KV_GROUP_SIZE
+    """Dequant one (pos, head) slot: K gets T_K^T + RoPE, V stays raw."""
+    pos = tl.program_id(0)
+    bh = tl.program_id(1)
+    bid = bh // NUM_KV_HEADS
+    hid = bh % NUM_KV_HEADS
 
-    seq_len = tl.load(Seq_lens_ptr + bid)
-    split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
-    split_start = split_len * sid
-    split_end = tl.minimum(split_start + split_len, seq_len)
-    if split_start >= split_end:
-        return
+    # Page lookup
+    page_idx = pos // BLOCK_SIZE
+    page_off = pos % BLOCK_SIZE
+    block_num = tl.load(Block_table_ptr + bid * stride_bt + page_idx).to(tl.int64)
+    slot_base = (block_num * stride_cb
+                 + tl.cast(page_off, tl.int64) * stride_cp
+                 + tl.cast(hid, tl.int64) * stride_ch)
 
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < HEAD_DIM
 
-    # Load query once (post-RoPE)
-    q_base = bid * stride_qb + hid * stride_qh
-    q_vec = tl.load(Q_ptr + q_base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
-
-    # Scratch buffer base for this (batch, q-head) — used for rotate_half
-    scratch_base = bid * stride_sb + hid * stride_sh
-
-    # MSE bit-unpacking precompute
+    # ======== K: dequant ========
     mse_bit_off = d_offs * MSE_BITS
     mse_byte_idx = mse_bit_off // 8
     mse_bit_shift = mse_bit_off % 8
     mse_umask = (1 << MSE_BITS) - 1
 
-    # Value bit-unpacking precompute
-    if VQB == 3:
-        val_bit_off = d_offs * 3
-        val_byte_idx = val_bit_off // 8
-        val_bit_shift = val_bit_off % 8
+    mr0 = tl.load(KV_cache_ptr + slot_base + mse_byte_idx, mask=d_mask, other=0).to(tl.int32)
+    mr1 = tl.load(KV_cache_ptr + slot_base + mse_byte_idx + 1, mask=d_mask, other=0).to(tl.int32)
+    mse_idx = ((mr0 | (mr1 << 8)) >> mse_bit_shift) & mse_umask
+    k_mse = tl.load(Centroids_ptr + mse_idx, mask=d_mask, other=0.0)
 
-    # RoPE rotate_half index: for d < D/2 read from d+D/2, else d-D/2
+    if NORM_CORRECTION:
+        cn2 = tl.sum(tl.where(d_mask, k_mse * k_mse, 0.0))
+        k_mse = k_mse * (1.0 / tl.sqrt(cn2 + 1e-16))
+
+    nb = slot_base + MSE_BYTES
+    nlo = tl.load(KV_cache_ptr + nb).to(tl.uint16)
+    nhi = tl.load(KV_cache_ptr + nb + 1).to(tl.uint16)
+    vnorm = (nlo | (nhi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+    k_wush = k_mse * vnorm  # [BLOCK_D]
+
+    # ======== K: T_K^T matmul (tiled) ========
+    # k_pre[d] = sum_{d_in} k_wush[d_in] * T_K_T[hid, d_in, d]
+    # Write k_wush to scratch for tiled reads
+    scratch_base = pos * stride_scratch_p + hid * stride_scratch_h
+    tl.store(Scratch_ptr + scratch_base + d_offs, k_wush, mask=d_mask)
+
+    tk_base = hid * stride_th
+    k_pre = tl.zeros([BLOCK_D], dtype=tl.float32)
+    for tile in range(0, HEAD_DIM, TILE_K):
+        t_offs = tile + tl.arange(0, TILE_K)
+        t_mask = t_offs < HEAD_DIM
+
+        # T_K_T[hid, tile:tile+TILE_K, :] — [TILE_K, BLOCK_D]
+        tk_addrs = tk_base + t_offs[:, None] * stride_tr + d_offs[None, :] * stride_tc
+        tk_tile = tl.load(T_K_T_ptr + tk_addrs,
+                          mask=t_mask[:, None] & d_mask[None, :], other=0.0)
+
+        # k_wush[tile:tile+TILE_K] from scratch
+        k_slice = tl.load(Scratch_ptr + scratch_base + t_offs,
+                          mask=t_mask, other=0.0)
+
+        k_pre += tl.sum(k_slice[:, None] * tk_tile, axis=0)
+
+    # ======== K: RoPE ========
+    # Write k_pre to scratch for rotate_half gather
+    tl.store(Scratch_ptr + scratch_base + d_offs, k_pre, mask=d_mask)
+
+    cos_idx = d_offs % HALF_DIM
+    cos_val = tl.load(Cos_ptr + pos * stride_cos_pos + cos_idx, mask=d_mask, other=1.0)
+    sin_val = tl.load(Sin_ptr + pos * stride_cos_pos + cos_idx, mask=d_mask, other=0.0)
+
     rot_idx = tl.where(d_offs < HALF_DIM, d_offs + HALF_DIM, d_offs - HALF_DIM)
     rot_sign = tl.where(d_offs < HALF_DIM, -1.0, 1.0)
+    k_rot = rot_sign * tl.load(Scratch_ptr + scratch_base + rot_idx, mask=d_mask, other=0.0)
 
-    # T_K^T base for this KV-head
-    tk_base = kv_head * stride_th
+    k_rope = k_pre * cos_val + k_rot * sin_val
 
-    # Online softmax accumulators
-    m_prev = -float("inf")
-    l_prev = 0.0
-    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-    bt_base = bid * stride_bt
+    ko_base = bid * stride_ko_b + hid * stride_ko_h + pos * stride_ko_s
+    tl.store(K_out_ptr + ko_base + d_offs, k_rope.to(tl.float16), mask=d_mask)
 
-    # ================================================================
-    # Process one token at a time (BLOCK_KV=1 for K-side matmul)
-    # ================================================================
-    for pos in range(split_start, split_end):
-        # Page lookup
-        page_idx = pos // BLOCK_SIZE
-        page_off = pos % BLOCK_SIZE
-        block_num = tl.load(Block_table_ptr + bt_base + page_idx).to(tl.int64)
-        slot_base = (block_num * stride_cb
-                     + tl.cast(page_off, tl.int64) * stride_cp
-                     + tl.cast(kv_head, tl.int64) * stride_ch)
+    # ======== V: dequant only (stays in WUSH space) ========
+    val_base = slot_base + KPS
+    if VQB == 4:
+        vb_idx = d_offs // 2
+        vb_shift = (d_offs % 2) * 4
+        vr = tl.load(KV_cache_ptr + val_base + vb_idx, mask=d_mask, other=0).to(tl.int32)
+        vi = ((vr >> vb_shift) & 0xF).to(tl.float32)
+    elif VQB == 3:
+        vbo = d_offs * 3
+        vbi = vbo // 8
+        vbs = vbo % 8
+        vr0 = tl.load(KV_cache_ptr + val_base + vbi, mask=d_mask, other=0).to(tl.int32)
+        vr1 = tl.load(KV_cache_ptr + val_base + vbi + 1, mask=d_mask, other=0).to(tl.int32)
+        vi = (((vr0 | (vr1 << 8)) >> vbs) & 0x7).to(tl.float32)
+    else:
+        vi = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-        # ---- K dequant: centroid lookup + norm ----
-        mse_addrs = slot_base + mse_byte_idx
-        mr0 = tl.load(KV_cache_ptr + mse_addrs, mask=d_mask, other=0).to(tl.int32)
-        mr1 = tl.load(KV_cache_ptr + mse_addrs + 1, mask=d_mask, other=0).to(tl.int32)
-        idx = ((mr0 | (mr1 << 8)) >> mse_bit_shift) & mse_umask
-        c = tl.load(Centroids_ptr + idx, mask=d_mask, other=0.0)
+    sb = val_base + VAL_DATA_BYTES
+    slo = tl.load(KV_cache_ptr + sb).to(tl.uint16)
+    shi = tl.load(KV_cache_ptr + sb + 1).to(tl.uint16)
+    vs = (slo | (shi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+    zlo = tl.load(KV_cache_ptr + sb + 2).to(tl.uint16)
+    zhi = tl.load(KV_cache_ptr + sb + 3).to(tl.uint16)
+    vz = (zlo | (zhi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+    v_vals = vi * vs + vz
 
-        if NORM_CORRECTION:
-            cn2 = tl.sum(tl.where(d_mask, c * c, 0.0))
-            c = c * (1.0 / tl.sqrt(cn2 + 1e-16))
-
-        nb = slot_base + MSE_BYTES
-        nlo = tl.load(KV_cache_ptr + nb).to(tl.uint16)
-        nhi = tl.load(KV_cache_ptr + nb + 1).to(tl.uint16)
-        vnorm = (nlo | (nhi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-
-        k_wush = c * vnorm  # [BLOCK_D] — key in WUSH space
-
-        # ---- K: T_K^T matmul (tiled over contraction dim) ----
-        # k_pre[d_out] = sum_{d_in} k_wush[d_in] * T_K_T[kv_head, d_in, d_out]
-        # Store k_wush to scratch so we can load tiles by offset.
-        tl.store(Scratch_ptr + scratch_base + d_offs, k_wush, mask=d_mask)
-
-        k_pre = tl.zeros([BLOCK_D], dtype=tl.float32)
-        for tile in range(0, HEAD_DIM, TILE_K):
-            t_offs = tile + tl.arange(0, TILE_K)
-            t_mask = t_offs < HEAD_DIM
-
-            # Load T_K_T tile: [TILE_K, BLOCK_D]
-            tk_addrs = (tk_base
-                        + t_offs[:, None] * stride_tr
-                        + d_offs[None, :] * stride_tc)
-            tk_tile = tl.load(
-                T_K_T_ptr + tk_addrs,
-                mask=t_mask[:, None] & d_mask[None, :], other=0.0,
-            )
-
-            # Load k_wush slice for this tile from scratch
-            k_slice = tl.load(
-                Scratch_ptr + scratch_base + t_offs,
-                mask=t_mask, other=0.0,
-            )  # [TILE_K]
-
-            # Accumulate: k_pre += k_slice @ tk_tile
-            k_pre += tl.sum(k_slice[:, None] * tk_tile, axis=0)
-
-        # ---- K: apply RoPE ----
-        # Write k_pre to scratch for rotate_half gather
-        tl.store(Scratch_ptr + scratch_base + d_offs, k_pre, mask=d_mask)
-
-        # Load cos/sin for this position.
-        # cos_cache is [max_pos, D/2]. For full D, duplicate: cos[d] = cos[d % half]
-        cos_idx = d_offs % HALF_DIM
-        cos_full = tl.load(Cos_ptr + pos * stride_cos_pos + cos_idx,
-                           mask=d_mask, other=1.0)
-        sin_full = tl.load(Sin_ptr + pos * stride_cos_pos + cos_idx,
-                           mask=d_mask, other=0.0)
-
-        # rotate_half via scratch gather
-        k_rot = rot_sign * tl.load(
-            Scratch_ptr + scratch_base + rot_idx,
-            mask=d_mask, other=0.0,
-        )
-        k_rope = k_pre * cos_full + k_rot * sin_full
-
-        # ---- Score ----
-        score = tl.sum(tl.where(d_mask, q_vec * k_rope, 0.0)) * ATTN_SCALE
-
-        # ---- Online softmax ----
-        n_e_max = tl.maximum(score, m_prev)
-        re_scale = tl.exp(m_prev - n_e_max)
-        p = tl.exp(score - n_e_max)
-
-        # ---- V dequant + accumulate (in WUSH space) ----
-        vb = slot_base + KPS
-        if VQB == 3:
-            va0 = vb + val_byte_idx
-            vr0 = tl.load(KV_cache_ptr + va0, mask=d_mask, other=0).to(tl.int32)
-            vr1 = tl.load(KV_cache_ptr + va0 + 1, mask=d_mask, other=0).to(tl.int32)
-            vi = (((vr0 | (vr1 << 8)) >> val_bit_shift) & 0x7).to(tl.float32)
-            sb = vb + VAL_DATA_BYTES
-            slo = tl.load(KV_cache_ptr + sb).to(tl.uint16)
-            shi = tl.load(KV_cache_ptr + sb + 1).to(tl.uint16)
-            vs = (slo | (shi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            zlo = tl.load(KV_cache_ptr + sb + 2).to(tl.uint16)
-            zhi = tl.load(KV_cache_ptr + sb + 3).to(tl.uint16)
-            vz = (zlo | (zhi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            vals = vi * vs + vz
-        else:
-            vbi = d_offs // 2
-            vbs = (d_offs % 2) * 4
-            vr = tl.load(KV_cache_ptr + vb + vbi, mask=d_mask, other=0).to(tl.int32)
-            vi = ((vr >> vbs) & 0xF).to(tl.float32)
-            sb = vb + VAL_DATA_BYTES
-            slo = tl.load(KV_cache_ptr + sb).to(tl.uint16)
-            shi = tl.load(KV_cache_ptr + sb + 1).to(tl.uint16)
-            vs = (slo | (shi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            zlo = tl.load(KV_cache_ptr + sb + 2).to(tl.uint16)
-            zhi = tl.load(KV_cache_ptr + sb + 3).to(tl.uint16)
-            vz = (zlo | (zhi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            vals = vi * vs + vz
-
-        acc = acc * re_scale + p * vals
-        l_prev = l_prev * re_scale + p
-        m_prev = n_e_max
-
-    # Write partial result (V still in WUSH space)
-    out_base = bid * stride_mb + hid * stride_mh + sid * stride_ms
-    safe_l = tl.where(l_prev > 0.0, l_prev, 1.0)
-    tl.store(Mid_o_ptr + out_base + d_offs, acc / safe_l, mask=d_mask)
-    tl.store(Mid_o_ptr + out_base + HEAD_DIM, m_prev + tl.log(safe_l))
+    vo_base = bid * stride_vo_b + hid * stride_vo_h + pos * stride_vo_s
+    tl.store(V_out_ptr + vo_base + d_offs, v_vals.to(tl.float16), mask=d_mask)
 
 
-# ---------------------------------------------------------------------------
-# Launcher
-# ---------------------------------------------------------------------------
+# ---- Launcher: two-kernel pipeline ----
 
 def triton_wush_decode_attention(
     query: torch.Tensor,        # [B, Hq, D] post-RoPE
@@ -258,87 +188,90 @@ def triton_wush_decode_attention(
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,
 ) -> torch.Tensor:
-    """Fused WUSH decode attention.
+    """Two-kernel WUSH decode attention.
 
-    K-side: dequant -> T_K^T (tiled matmul) -> RoPE -> score (all in-kernel)
-    V-side: dequant -> accumulate in WUSH space -> T_V^{-1} applied once
+    Kernel 1: Parallel dequant + T_K^T + RoPE (one thread block per token)
+    Kernel 2: Flash attention / SDPA on dequanted K/V
+    Post: T_V^{-1} applied once to attention output
     """
     B, Hq, D = query.shape
     Hk = kv_cache.shape[2]
     block_size = kv_cache.shape[1]
-    kv_group_size = Hq // Hk
+    gqa = Hq // Hk
     device = query.device
     half_dim = D // 2
 
     mse_bytes = math.ceil(D * mse_bits / 8)
     val_data_bytes = math.ceil(D * value_quant_bits / 8)
     BLOCK_D = triton.next_power_of_2(D)
-    NUM_KV_SPLITS = max_num_kv_splits
 
-    # Scratch buffer for rotate_half (one vector per (batch, q-head))
-    scratch = torch.empty(B, Hq, D, dtype=torch.float32, device=device)
+    # Max sequence length across batch (avoid GPU sync — use tensor op)
+    max_seq = int(seq_lens.max().item())
+    alloc_len = math.ceil(max_seq / block_size) * block_size
 
-    # Intermediate buffer
-    if (mid_o_buf is not None
-            and mid_o_buf.shape[0] >= B
-            and mid_o_buf.shape[2] >= NUM_KV_SPLITS):
-        mid_o = mid_o_buf[:B, :Hq, :NUM_KV_SPLITS, :]
+    # Reuse pre-allocated buffers via buf_holder to avoid per-call allocation
+    _alloc = alloc_len * Hk * D
+    k_deq = getattr(buf_holder, '_wush_k_deq', None) if buf_holder else None
+    if k_deq is None or k_deq.numel() < B * _alloc:
+        k_deq = torch.empty(B, Hk, alloc_len, D, dtype=torch.float16, device=device)
+        v_deq = torch.empty(B, Hk, alloc_len, D, dtype=torch.float16, device=device)
+        scratch = torch.empty(alloc_len, Hk, D, dtype=torch.float32, device=device)
+        if buf_holder is not None:
+            buf_holder._wush_k_deq = k_deq
+            buf_holder._wush_v_deq = v_deq
+            buf_holder._wush_scratch = scratch
     else:
-        mid_o = torch.empty(B, Hq, NUM_KV_SPLITS, D + 1,
-                            dtype=torch.float32, device=device)
+        v_deq = buf_holder._wush_v_deq
+        scratch = buf_holder._wush_scratch
+        k_deq = k_deq[:B, :, :alloc_len, :]
+        v_deq = v_deq[:B, :, :alloc_len, :]
+        scratch = scratch[:alloc_len, :, :]
 
     T_K_T = T_K_T.contiguous().float()
     cos_cache = cos_cache.contiguous().float()
     sin_cache = sin_cache.contiguous().float()
 
-    grid = (B, Hq, NUM_KV_SPLITS)
-    _wush_decode_stage1[grid](
-        query.float().contiguous(),
-        kv_cache, block_table, seq_lens, centroids,
+    # ---- Kernel 1: fused dequant + T_K^T + RoPE ----
+    grid = (alloc_len, B * Hk)
+    _wush_dequant_transform_kv[grid](
+        kv_cache, block_table, centroids,
         T_K_T, cos_cache, sin_cache,
-        scratch, mid_o,
+        k_deq, v_deq, scratch,
         # Strides
-        query.stride(0), query.stride(1),
+        k_deq.stride(0), k_deq.stride(1), k_deq.stride(2),
+        v_deq.stride(0), v_deq.stride(1), v_deq.stride(2),
         kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
         block_table.stride(0),
-        mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
         T_K_T.stride(0), T_K_T.stride(1), T_K_T.stride(2),
-        scratch.stride(0), scratch.stride(1),
         cos_cache.stride(0),
+        scratch.stride(0), scratch.stride(1),
         # Constexpr
-        NUM_KV_HEADS=Hk, HEAD_DIM=D, HALF_DIM=half_dim,
-        BLOCK_SIZE=block_size, NUM_KV_SPLITS=NUM_KV_SPLITS,
-        KV_GROUP_SIZE=kv_group_size,
-        MSE_BITS=mse_bits, MSE_BYTES=mse_bytes, KPS=key_packed_size,
-        VQB=value_quant_bits, VAL_DATA_BYTES=val_data_bytes,
-        ATTN_SCALE=scale, BLOCK_D=BLOCK_D,
+        HEAD_DIM=D, HALF_DIM=half_dim,
+        BLOCK_SIZE=block_size, NUM_KV_HEADS=Hk,
+        MSE_BITS=mse_bits, MSE_BYTES=mse_bytes,
+        KPS=key_packed_size, VQB=value_quant_bits,
+        VAL_DATA_BYTES=val_data_bytes, BLOCK_D=BLOCK_D,
         NORM_CORRECTION=1 if norm_correction else 0,
         num_warps=4,
     )
 
-    # Stage 2: reduce across splits
-    if output_buf is not None and output_buf.shape[0] >= B:
-        output = output_buf[:B, :Hq, :]
-    else:
-        output = torch.empty(B, Hq, D, dtype=torch.float32, device=device)
+    # ---- Kernel 2: batched attention via SDPA ----
+    # For decode (B queries, each attending to S cached tokens), batch across B.
+    # k_deq [B, Hk, alloc_len, D], v_deq [B, Hk, alloc_len, D]
+    # GQA expand Hk → Hq
+    k_exp = k_deq[:, :, :max_seq, :].repeat_interleave(gqa, dim=1)  # [B, Hq, max_seq, D]
+    v_exp = v_deq[:, :, :max_seq, :].repeat_interleave(gqa, dim=1)  # [B, Hq, max_seq, D]
 
-    if lse_buf is not None and lse_buf.shape[0] >= B:
-        lse = lse_buf[:B, :Hq]
-    else:
-        lse = torch.empty(B, Hq, dtype=torch.float32, device=device)
+    output = F.scaled_dot_product_attention(
+        query.float().unsqueeze(2),  # [B, Hq, 1, D]
+        k_exp.float(),               # [B, Hq, max_seq, D]
+        v_exp.float(),               # [B, Hq, max_seq, D]
+        scale=scale,
+    )[:, :, 0, :]  # [B, Hq, D]
 
-    _fwd_kernel_stage2[(B, Hq)](
-        mid_o, output, lse, seq_lens,
-        mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
-        output.stride(0), output.stride(1),
-        lse.stride(0),
-        NUM_KV_SPLITS=NUM_KV_SPLITS, BLOCK_DV=BLOCK_D, Lv=D,
-        num_warps=4,
-    )
-
-    # Apply T_V^{-1} to output (one matmul, not per-token)
-    # output: [B, Hq, D], T_V_inv: [Hk, D, D]
-    T_V_inv_q = T_V_inv.repeat_interleave(kv_group_size, dim=0)  # [Hq, D, D]
-    result = torch.einsum('bhd,hde->bhe', output, T_V_inv_q.float())
+    # ---- Post: apply T_V^{-1} to output ----
+    # output is in WUSH V-space; apply per-head T_V^{-1}
+    T_V_inv_q = T_V_inv.float().repeat_interleave(gqa, dim=0)  # [Hq, D, D]
+    result = torch.einsum('bhd,hde->bhe', output.float(), T_V_inv_q)
 
     return result.to(query.dtype)
